@@ -1,1 +1,7 @@
 streamlit
+pdfplumber
+pandas
+pdf2image
+openai
+pillow
+fitz
