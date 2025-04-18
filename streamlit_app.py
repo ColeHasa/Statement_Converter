@@ -1,119 +1,193 @@
 import streamlit as st
-import pdfplumber
+import pdfplumber, fitz, openai, tempfile, os, base64, csv, re
 import pandas as pd
-from io import BytesIO
-import tempfile
-import os
-import base64
-import openai
-import re
-import fitz  # PyMuPDF
-
-# Set your OpenAI API key
-openai.api_key = ""  # 🔐 Replace with your key
-
-def gpt_transaction_extraction(image_bytes):
-    encoded = base64.b64encode(image_bytes).decode('utf-8')
-    data_url = f"data:image/png;base64,{encoded}"
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "From this bank statement, extract only the transaction rows. Each transaction must have exactly 3 fields: Date, Description, and Amount. Format the response as raw CSV with a header row: Date,Description,Amount. Do not include balances, totals, summaries, or any additional explanations. If a line is missing any of the three fields, skip it. Also do not add additional headers for each page converted, only a header at the very beginning. it should read as a header at the top and then rtansactions listed one after another from all pages being converted."},
-                        {"type": "image_url", "image_url": {"url": data_url}}
-                    ]
-                }
-            ],
-            max_tokens=1200
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        st.error(f"GPT Vision failed: {e}")
-        return ""
-
-def gpt_transaction_extraction_from_text(text):
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Extract only the transactions from the following bank statement text. Format the result as raw CSV with three columns: Date, Description, Amount. Do not include any explanation, just the CSV.\n\n{text}"
-                }
-            ],
-            max_tokens=1200
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        st.error(f"GPT Text Extraction failed: {e}")
-        return ""
-
-def extract_text_from_text_pdf(pdf_file):
-    text = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-def extract_images_from_pdf(pdf_file):
-    doc = fitz.open(pdf_file)
-    results = []
-    for i, page in enumerate(doc):
-        st.info(f"Rendering page {i+1} for GPT OCR...")
-        pix = page.get_pixmap(dpi=150)
-        image_bytes = pix.tobytes("png")
-        response = gpt_transaction_extraction(image_bytes)
-        results.append(response)
-    return "\n".join(results)
-
+from dateutil import parser
 from io import StringIO
+from dotenv import load_dotenv
 
-def parse_csv_output(csv_text):
+# ───────────────────  CONFIG  ────────────────────
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+COMMON_PROMPT = (
+    "Extract only the transaction rows. "
+    "Each row must have exactly three fields: Date, Description, Amount. "
+    "Return plain CSV with a single header row (Date,Description,Amount) — "
+    "**do NOT** wrap the output in back‑ticks, apostrophes, or other fences."
+)
+
+# ──────────────────  GPT HELPERS  ─────────────────
+def gpt_from_image(img_bytes: bytes) -> str:
+    data_url = f"data:image/png;base64,{base64.b64encode(img_bytes).decode()}"
+    resp = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": COMMON_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]
+        }],
+        max_tokens=1200
+    )
+    return resp.choices[0].message.content.strip()
+
+def gpt_from_text(text: str) -> str:
+    resp = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": COMMON_PROMPT + "\n\n" + text}],
+        max_tokens=7500
+    )
+    return resp.choices[0].message.content.strip()
+
+# ─────────────────  PDF HELPERS  ──────────────────
+def text_layer(path: str) -> str:
+    with pdfplumber.open(path) as pdf:
+        return "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+def image_ocr(path: str) -> str:
+    doc, parts = fitz.open(path), []
+    for i, page in enumerate(doc):
+        st.info(f"OCR page {i + 1}")
+        parts.append(gpt_from_image(page.get_pixmap(dpi=150).tobytes("png")))
+    return "\n".join(parts)
+
+# ────────────────  CSV SANITISER  ─────────────────
+FENCE_RE = re.compile(r"""^[\s`'"“”‘’]{0,5}(?:`{3,}|'{3,}|"{3,})?\s*(?:csv)?\s*$""", re.I)
+COMMENT_RE = re.compile(r"^\s*(here\s+is|note:)", re.I)
+
+def clean_csv_text(txt: str) -> str:
+    return "\n".join(
+        l for l in txt.splitlines()
+        if l.strip() and not (FENCE_RE.match(l) or COMMENT_RE.match(l))
+    )
+
+# ────────────────  NORMALISERS  ───────────────────
+PAREN_RE = re.compile(r"^\(\s*\$?([0-9,.]+)\s*\)$")
+
+def normalise_amount(raw: str) -> str:
+    txt = raw.replace(",", "").replace("$", "").strip()
+    if (m := PAREN_RE.match(txt)):
+        return f"-{m.group(1)}"
+    if txt.endswith("-"):
+        return f"-{txt[:-1].strip()}"
+    return txt
+
+def normalise_date(raw: str, default_year: int) -> str:
+    """
+    Convert any readable date string into MM/DD/YYYY using a default year if missing.
+    """
+    txt = raw.strip()
+    if not txt:
+        return ""
+
+    txt = re.sub(r"[‑–—−]", "/", txt)  # normalize dashes
+
     try:
-        return pd.read_csv(StringIO(csv_text), skip_blank_lines=True)
-    except Exception as e:
-        st.warning(f"Failed to parse CSV output: {e}")
-        return pd.DataFrame()
+        dt = parser.parse(
+            txt,
+            dayfirst=False,
+            fuzzy=True,
+            default=pd.Timestamp(f"{default_year}-01-01")
+        )
+        return dt.strftime("%m/%d/%Y")
+    except Exception:
+        return ""
+
+# ─────────────────  CSV PARSER  ───────────────────
+HEADER_PREFIXES = ("date", "description", "amount", "here", "note", "csv")
+
+def robust_parse(csv_text: str, default_year: int) -> pd.DataFrame:
+    csv_text = clean_csv_text(csv_text)
+    rows, reader = [], csv.reader(StringIO(csv_text), delimiter=",", quotechar='"')
+
+    for row in reader:
+        if len(row) < 3:
+            continue
+
+        cell0 = row[0].strip().lower()
+        if cell0.startswith(HEADER_PREFIXES):
+            continue
+
+        date_fixed = normalise_date(row[0], default_year)
+        if not date_fixed:
+            continue  # skip bad date rows
+
+        descr = ",".join(row[1:-1]).strip() if len(row) > 3 else row[1]
+        amount_fixed = normalise_amount(row[-1])
+
+        rows.append([date_fixed, descr, amount_fixed])
+
+    return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
+
+# ────────────────  STREAMLIT APP  ────────────────
+def file_key(upl) -> str:
+    return f"{upl.name}_{upl.size}_{upl.type}"
 
 def main():
-    st.title("Bank PDF to QuickBooks CSV Converter (GPT with CSV Output)")
+    st.title("Bank PDF → QuickBooks CSV  (cached, GPT‑4o)")
 
-    uploaded_file = st.file_uploader("Upload a bank statement PDF", type="pdf")
+    upl = st.file_uploader("Upload bank‑statement PDF", type="pdf")
+    if not upl:
+        st.info("👆 Upload a PDF to begin.")
+        return
 
-    if uploaded_file:
-        raw_bytes = uploaded_file.read()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(raw_bytes)
-            tmp_file_path = tmp_file.name
+    key = file_key(upl)
 
-        try:
-            text = extract_text_from_text_pdf(tmp_file_path)
-            if not text.strip():
-                raise ValueError("Empty text from pdfplumber, using image-based OCR...")
-            st.success("Extracted text. Sending to GPT for CSV formatting...")
-            gpt_output = gpt_transaction_extraction_from_text(text)
-        except:
-            st.warning("Text extraction failed. Using image-based OCR with GPT...")
-            gpt_output = extract_images_from_pdf(tmp_file_path)
+    if st.session_state.get("cached_key") != key:
+        with st.spinner("Processing PDF…"):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(upl.read())
+                pdf_path = tmp.name
 
-        os.remove(tmp_file_path)
+            txt = text_layer(pdf_path)
 
-        st.subheader("GPT Extracted Transactions (CSV Format)")
-        st.text_area("Review or edit the extracted CSV", value=gpt_output, height=300)
+            if txt.strip():
+                year_source = txt
+                raw_csv = gpt_from_text(txt)
+            else:
+                raw_csv = image_ocr(pdf_path)
+                year_source = raw_csv  # fallback to OCR text
 
-        df = parse_csv_output(gpt_output)
-        if not df.empty:
-            st.dataframe(df)
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("Download CSV for QuickBooks", csv, "qbo_upload.csv", "text/csv")
-        else:
-            st.error("Could not parse GPT output. Please review the extracted content manually.")
+            # Extract year from whichever text we used
+            year_match = re.search(r"\b(20\d{2})\b", year_source)
+            default_year = int(year_match.group(1)) if year_match else pd.Timestamp.now().year
+
+            os.remove(pdf_path)
+
+            df = robust_parse(raw_csv, default_year)
+
+            # ✅ store everything including default_year
+            st.session_state.update(
+                cached_key=key,
+                cached_csv=raw_csv,
+                cached_df=df,
+                cached_year=default_year
+            )
+    else:
+        raw_csv = st.session_state.cached_csv
+        df = st.session_state.cached_df
+        default_year = st.session_state.cached_year  # ✅ for reuse
+
+    st.subheader("Raw CSV (editable)")
+    edited = st.text_area("Review / edit CSV below",
+                          value=clean_csv_text(raw_csv), height=300)
+
+    df_display = robust_parse(edited, default_year)
+    if df_display.empty:
+        st.info("⚠️ No transaction rows detected after cleaning. "
+                "Check for unusual date formats in the raw CSV above.")
+        return
+
+    st.subheader(f"Preview  ({len(df_display)} rows)")
+    st.dataframe(df_display, use_container_width=True)
+
+    st.download_button(
+        "Download CSV for QuickBooks",
+        data=df_display.to_csv(index=False).encode("utf-8"),
+        file_name="StatementConverterCSV.csv",
+        mime="text/csv"
+    )
 
 if __name__ == "__main__":
     main()
