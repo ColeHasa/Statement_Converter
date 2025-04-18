@@ -10,10 +10,10 @@ load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 COMMON_PROMPT = (
-    "Extract only the transaction rows. "
-    "Each row must have exactly three fields: Date, Description, Amount. "
-    "Return plain CSV with a single header row (Date,Description,Amount) — "
-    "**do NOT** wrap the output in back‑ticks, apostrophes, or other fences."
+    "Extract all financial transactions from the statement, including charges, purchases, deposits, payments, credits, and refunds. "
+    "Each row must include exactly three fields: Date, Description, and Amount. "
+    "The Amount should appear exactly as shown on the statement, including whether it is positive or negative, but with commas removed (e.g., 1000.00 instead of 1,000.00). "
+    "Return only raw CSV with a header row: Date,Description,Amount — no formatting, no backticks, and no extra commentary."
 )
 
 # ──────────────────  GPT HELPERS  ─────────────────
@@ -74,49 +74,40 @@ def normalise_amount(raw: str) -> str:
     return txt
 
 def normalise_date(raw: str, default_year: int) -> str:
-    """
-    Convert any readable date string into MM/DD/YYYY using a default year if missing.
-    """
     txt = raw.strip()
     if not txt:
         return ""
-
-    txt = re.sub(r"[‑–—−]", "/", txt)  # normalize dashes
-
+    txt = re.sub(r"[‑–—−]", "/", txt)
     try:
-        dt = parser.parse(
-            txt,
-            dayfirst=False,
-            fuzzy=True,
-            default=pd.Timestamp(f"{default_year}-01-01")
-        )
+        dt = parser.parse(txt, dayfirst=False, fuzzy=True, default=pd.Timestamp(f"{default_year}-01-01"))
         return dt.strftime("%m/%d/%Y")
     except Exception:
         return ""
 
-# ─────────────────  CSV PARSER  ───────────────────
+# ────────────────  FINAL CSV PARSER  ────────────────
 HEADER_PREFIXES = ("date", "description", "amount", "here", "note", "csv")
 
 def robust_parse(csv_text: str, default_year: int) -> pd.DataFrame:
     csv_text = clean_csv_text(csv_text)
-    rows, reader = [], csv.reader(StringIO(csv_text), delimiter=",", quotechar='"')
+    reader = csv.reader(StringIO(csv_text), delimiter=",", quotechar='"')
+    rows = []
 
     for row in reader:
+        if not row or row[0].strip().lower().startswith(HEADER_PREFIXES):
+            continue
         if len(row) < 3:
             continue
 
-        cell0 = row[0].strip().lower()
-        if cell0.startswith(HEADER_PREFIXES):
+        date_raw = row[0].strip()
+        amount_raw = row[-1].strip()
+        description = ",".join(row[1:-1]).strip()
+
+        date_fixed = normalise_date(date_raw, default_year)
+        if not date_fixed:
             continue
 
-        date_fixed = normalise_date(row[0], default_year)
-        if not date_fixed:
-            continue  # skip bad date rows
-
-        descr = ",".join(row[1:-1]).strip() if len(row) > 3 else row[1]
-        amount_fixed = normalise_amount(row[-1])
-
-        rows.append([date_fixed, descr, amount_fixed])
+        amount_fixed = normalise_amount(amount_raw)
+        rows.append([date_fixed, description, amount_fixed])
 
     return pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
 
@@ -147,9 +138,8 @@ def main():
                 raw_csv = gpt_from_text(txt)
             else:
                 raw_csv = image_ocr(pdf_path)
-                year_source = raw_csv  # fallback to OCR text
+                year_source = raw_csv
 
-            # Extract year from whichever text we used
             year_match = re.search(r"\b(20\d{2})\b", year_source)
             default_year = int(year_match.group(1)) if year_match else pd.Timestamp.now().year
 
@@ -157,7 +147,6 @@ def main():
 
             df = robust_parse(raw_csv, default_year)
 
-            # ✅ store everything including default_year
             st.session_state.update(
                 cached_key=key,
                 cached_csv=raw_csv,
@@ -167,11 +156,10 @@ def main():
     else:
         raw_csv = st.session_state.cached_csv
         df = st.session_state.cached_df
-        default_year = st.session_state.cached_year  # ✅ for reuse
+        default_year = st.session_state.cached_year
 
     st.subheader("Raw CSV (editable)")
-    edited = st.text_area("Review / edit CSV below",
-                          value=clean_csv_text(raw_csv), height=300)
+    edited = st.text_area("Review / edit CSV below", value=clean_csv_text(raw_csv), height=300)
 
     df_display = robust_parse(edited, default_year)
     if df_display.empty:
